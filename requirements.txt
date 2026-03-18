@@ -1,0 +1,9 @@
+streamlit
+openai
+numpy
+faiss-cpu
+pypfd
+pytesseract
+pillow
+pandas
+openpyxl
