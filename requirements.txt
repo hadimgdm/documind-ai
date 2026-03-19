@@ -2,7 +2,7 @@ streamlit
 openai
 numpy
 faiss-cpu
-pypfd
+pypdf
 pytesseract
 pillow
 pandas
