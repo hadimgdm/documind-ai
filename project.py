@@ -3,6 +3,10 @@ import re
 import json
 import hashlib
 import time
+import random
+import smtplib
+import ssl
+from email.message import EmailMessage
 from pathlib import Path
 from io import BytesIO
 
@@ -36,6 +40,7 @@ BASE_DIR.mkdir(exist_ok=True)
 # Security storage files
 USERS_FILE = BASE_DIR / "users.json"
 LOG_FILE = BASE_DIR / "logs.json"
+OTP_FILE = BASE_DIR / "otp_store.json"
 
 # Models
 EMBED_MODEL = "text-embedding-3-small"
@@ -51,6 +56,8 @@ FINAL_TOP_K = 5
 MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024
 MAX_REQUESTS_PER_DAY = 100
 ALLOWED_FILE_TYPES = {".txt", ".pdf", ".png", ".jpg", ".jpeg", ".xlsx", ".xls"}
+OTP_EXPIRY_SECONDS = 10 * 60
+OTP_RESEND_COOLDOWN_SECONDS = 60
 
 # Set Tesseract path manually if needed
 # pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -65,6 +72,26 @@ if "user" not in st.session_state:
 
 if "role" not in st.session_state:
     st.session_state.role = None
+
+if "auth_mode" not in st.session_state:
+    st.session_state.auth_mode = "Login"
+
+if "otp_sent_email" not in st.session_state:
+    st.session_state.otp_sent_email = ""
+
+if "otp_verified_email" not in st.session_state:
+    st.session_state.otp_verified_email = ""
+
+if "otp_debug_code" not in st.session_state:
+    st.session_state.otp_debug_code = ""
+
+# Generate deterministic workspace ID from email
+def generate_workspace_id(email: str) -> str:
+    email = email.strip().lower()
+    local_part = email.split("@")[0] if "@" in email else email
+    local_part = re.sub(r"[^a-zA-Z0-9]+", "-", local_part).strip("-").lower() or "user"
+    digest = hashlib.sha256(email.encode("utf-8")).hexdigest()[:10]
+    return f"ws-{local_part[:24]}-{digest}"
 
 # Clean client ID
 def safe_client_id(raw: str) -> str:
@@ -110,6 +137,132 @@ def normalize_text(text: str) -> str:
 # Security: auth / access
 # =========================
 
+# Password policy
+def validate_password_policy(password: str) -> list[str]:
+    errors = []
+
+    if len(password) < 8:
+        errors.append("Password must be at least 8 characters long.")
+    if not re.search(r"[A-Z]", password):
+        errors.append("Password must contain at least one uppercase letter (A-Z).")
+    if not re.search(r"[a-z]", password):
+        errors.append("Password must contain at least one lowercase letter (a-z).")
+    if not re.search(r"\d", password):
+        errors.append("Password must contain at least one number (0-9).")
+    if not re.search(r"[!@#$%^&*]", password):
+        errors.append("Password must contain at least one symbol (!@#$%^&*).")
+
+    return errors
+
+# OTP storage
+def load_otp_store() -> dict:
+    data = load_json(OTP_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+def save_otp_store(store: dict) -> None:
+    save_json(OTP_FILE, store)
+
+def cleanup_expired_otp(store: dict | None = None) -> dict:
+    store = store if store is not None else load_otp_store()
+    now = time.time()
+    cleaned = {
+        email: item for email, item in store.items()
+        if now - item.get("created_at", 0) <= OTP_EXPIRY_SECONDS
+    }
+    if cleaned != store:
+        save_otp_store(cleaned)
+    return cleaned
+
+def send_signup_otp(email: str) -> tuple[bool, str, str]:
+    email = email.strip().lower()
+    users = load_users()
+
+    if not email:
+        return False, "Email is required.", ""
+    if "@" not in email:
+        return False, "Please enter a valid email address.", ""
+    if email in users:
+        return False, "This email is already registered.", ""
+
+    store = cleanup_expired_otp()
+    now = time.time()
+    existing = store.get(email)
+
+    if existing and now - existing.get("last_sent_at", 0) < OTP_RESEND_COOLDOWN_SECONDS:
+        wait_seconds = int(OTP_RESEND_COOLDOWN_SECONDS - (now - existing.get("last_sent_at", 0)))
+        return False, f"Please wait {wait_seconds} seconds before requesting a new code.", ""
+
+    otp_code = f"{random.randint(0, 999999):06d}"
+    store[email] = {
+        "code": otp_code,
+        "created_at": now,
+        "last_sent_at": now,
+        "attempts": 0
+    }
+    save_otp_store(store)
+
+    smtp_host = os.getenv("SMTP_HOST")
+    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_password = os.getenv("SMTP_PASSWORD")
+    smtp_from = os.getenv("SMTP_FROM", smtp_user or "noreply@example.com")
+
+    if smtp_host and smtp_user and smtp_password:
+        try:
+            msg = EmailMessage()
+            msg["Subject"] = "Your DocuMind AI verification code"
+            msg["From"] = smtp_from
+            msg["To"] = email
+            msg.set_content(
+                "Your DocuMind AI verification code is: "
+                f"{otp_code}\n\n"
+                "This code expires in 10 minutes."
+            )
+
+            context = ssl.create_default_context()
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+                server.starttls(context=context)
+                server.login(smtp_user, smtp_password)
+                server.send_message(msg)
+
+            log_event(email, "otp_sent", "smtp")
+            return True, "Verification code sent to your email.", ""
+        except Exception as e:
+            log_event(email, "otp_send_fallback", str(e)[:200])
+
+    log_event(email, "otp_sent", "fallback_test_mode")
+    return True, "SMTP is not configured. Test-mode OTP generated.", otp_code
+
+def verify_signup_otp(email: str, otp_code: str) -> tuple[bool, str]:
+    email = email.strip().lower()
+    otp_code = otp_code.strip()
+    store = cleanup_expired_otp()
+    item = store.get(email)
+
+    if not item:
+        return False, "No active OTP found for this email. Please request a new code."
+
+    if item.get("attempts", 0) >= 5:
+        store.pop(email, None)
+        save_otp_store(store)
+        return False, "Too many failed attempts. Please request a new code."
+
+    if time.time() - item.get("created_at", 0) > OTP_EXPIRY_SECONDS:
+        store.pop(email, None)
+        save_otp_store(store)
+        return False, "This OTP has expired. Please request a new code."
+
+    if item.get("code") != otp_code:
+        item["attempts"] = item.get("attempts", 0) + 1
+        store[email] = item
+        save_otp_store(store)
+        return False, "Invalid verification code."
+
+    store.pop(email, None)
+    save_otp_store(store)
+    log_event(email, "otp_verified", "success")
+    return True, "Email verified successfully."
+
 # Load users
 def load_users() -> dict:
     return load_json(USERS_FILE, {})
@@ -143,7 +296,7 @@ def log_event(user: str, action: str, details: str = "") -> None:
     save_logs(logs)
 
 # Register user
-def register_user(email: str, password: str, confirm_password: str) -> tuple[bool, str]:
+def register_user(email: str, password: str, confirm_password: str, email_verified: bool = False) -> tuple[bool, str]:
     email = email.strip().lower()
     users = load_users()
 
@@ -153,23 +306,32 @@ def register_user(email: str, password: str, confirm_password: str) -> tuple[boo
         return False, "Please enter a valid email address."
     if email in users:
         return False, "This email is already registered."
-    if len(password) < 8:
-        return False, "Password must be at least 8 characters long."
+
+    password_errors = validate_password_policy(password)
+    if password_errors:
+        return False, " ".join(password_errors)
+
     if password != confirm_password:
         return False, "Passwords do not match."
 
+    if not email_verified:
+        return False, "Please verify your email before completing signup."
+
     hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    workspace_id = generate_workspace_id(email)
 
     users[email] = {
         "password": hashed,
         "role": "owner",
-        "allowed_clients": [],
+        "allowed_clients": [workspace_id],
+        "workspace_id": workspace_id,
         "created_at": time.time(),
-        "is_active": True
+        "is_active": True,
+        "email_verified": True
     }
 
     save_users(users)
-    log_event(email, "signup", "account_created")
+    log_event(email, "signup", f"account_created | workspace={workspace_id}")
     return True, "Account created successfully. Please log in."
 
 # Login user
@@ -190,6 +352,9 @@ def login_user(email: str, password: str) -> tuple[bool, str]:
     if bcrypt.checkpw(password.encode("utf-8"), hashed):
         st.session_state.user = email
         st.session_state.role = user.get("role", "user")
+        st.session_state.otp_verified_email = ""
+        st.session_state.otp_sent_email = ""
+        st.session_state.otp_debug_code = ""
         log_event(email, "login", "success")
         return True, "Logged in successfully."
 
@@ -213,19 +378,29 @@ def authorize_client_access(email: str, client_id: str) -> tuple[bool, str]:
         return False, "User not found."
 
     role = user.get("role", "user")
+    workspace_id = user.get("workspace_id") or generate_workspace_id(email)
     allowed_clients = user.get("allowed_clients", [])
 
     if role == "superadmin":
+        return True, "Access granted."
+
+    if client_id == workspace_id:
+        if workspace_id not in allowed_clients:
+            user["allowed_clients"] = list(dict.fromkeys([*allowed_clients, workspace_id]))
+            user["workspace_id"] = workspace_id
+            users[email] = user
+            save_users(users)
         return True, "Access granted."
 
     if client_id in allowed_clients:
         return True, "Access granted."
 
     if not allowed_clients:
-        user["allowed_clients"] = [client_id]
+        user["allowed_clients"] = [workspace_id]
+        user["workspace_id"] = workspace_id
         users[email] = user
         save_users(users)
-        log_event(email, "client_bound", client_id)
+        log_event(email, "client_bound", workspace_id)
         return True, "First workspace assigned."
 
     return False, "You are not allowed to access this workspace."
@@ -743,39 +918,115 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-st.info("Step 1: Sign up or log in → Step 2: Enter Client ID → Step 3: Upload files → Step 4: Build Index → Step 5: Ask questions or generate reports")
+st.info("Step 1: Sign up or log in → Step 2: Your workspace is created automatically from your email → Step 3: Upload files → Step 4: Build Index → Step 5: Ask questions or generate reports")
 
 # Authentication
 st.subheader("🔐 Authentication")
 
-auth_col1, auth_col2 = st.columns(2)
+auth_toggle_col1, auth_toggle_col2 = st.columns(2)
+with auth_toggle_col1:
+    if st.button("Login", use_container_width=True, type="primary" if st.session_state.auth_mode == "Login" else "secondary"):
+        st.session_state.auth_mode = "Login"
 
-with auth_col1:
-    auth_mode = st.radio("Mode", ["Login", "Signup"], horizontal=True)
-    auth_email = st.text_input("Email", key="auth_email")
-    auth_password = st.text_input("Password", type="password", key="auth_password")
+with auth_toggle_col2:
+    if st.button("Sign Up", use_container_width=True, type="primary" if st.session_state.auth_mode == "Signup" else "secondary"):
+        st.session_state.auth_mode = "Signup"
 
-with auth_col2:
-    auth_confirm = ""
-    if auth_mode == "Signup":
-        auth_confirm = st.text_input("Confirm Password", type="password", key="auth_confirm")
-    st.write("")
-    st.write("")
+st.markdown("---")
 
-    if auth_mode == "Signup":
-        if st.button("Create Account", use_container_width=True):
-            ok, msg = register_user(auth_email, auth_password, auth_confirm)
-            if ok:
-                st.success(msg)
-            else:
-                st.error(msg)
+if st.session_state.auth_mode == "Login":
+    login_left, login_right = st.columns([1.2, 1])
 
-    if auth_mode == "Login":
-        if st.button("Login", use_container_width=True):
+    with login_left:
+        st.markdown("### Welcome back")
+        auth_email = st.text_input("Email", key="login_email")
+        auth_password = st.text_input("Password", type="password", key="login_password")
+
+    with login_right:
+        st.markdown("### Sign in")
+        st.caption("Use your verified account to access your private workspace.")
+        st.write("")
+        if st.button("Login", use_container_width=True, key="login_submit"):
             ok, msg = login_user(auth_email, auth_password)
             if ok:
                 st.success(msg)
                 st.rerun()
+            else:
+                st.error(msg)
+
+else:
+    signup_left, signup_right = st.columns([1.35, 1])
+
+    with signup_left:
+        st.markdown("### Create your account")
+        signup_email = st.text_input("Email", key="signup_email")
+        signup_password = st.text_input("Password", type="password", key="signup_password")
+        signup_confirm = st.text_input("Confirm Password", type="password", key="signup_confirm")
+        otp_code = st.text_input("Email Verification Code (OTP)", key="signup_otp", max_chars=6)
+
+        password_errors = validate_password_policy(signup_password) if signup_password else []
+        with st.expander("Password requirements", expanded=True):
+            st.markdown("- Minimum 8 characters")
+            st.markdown("- At least one uppercase letter (A-Z)")
+            st.markdown("- At least one lowercase letter (a-z)")
+            st.markdown("- At least one number (0-9)")
+            st.markdown("- At least one symbol (!@#$%^&*)")
+
+            if signup_password:
+                if password_errors:
+                    for err in password_errors:
+                        st.error(err)
+                else:
+                    st.success("Password policy passed.")
+
+    with signup_right:
+        st.markdown("### Verify email")
+        predicted_workspace = generate_workspace_id(signup_email) if signup_email else "ws-generated-after-email"
+        st.caption("Client ID has been removed from the UI.")
+        st.info(f"Your workspace will be created automatically: `{predicted_workspace}`")
+
+        send_disabled = not signup_email
+        if st.button("Send Verification Code", use_container_width=True, disabled=send_disabled, key="send_otp_btn"):
+            ok, msg, debug_code = send_signup_otp(signup_email)
+            if ok:
+                st.session_state.otp_sent_email = signup_email.strip().lower()
+                st.session_state.otp_debug_code = debug_code
+                st.success(msg)
+                if debug_code:
+                    st.warning(f"Test mode OTP: {debug_code}")
+            else:
+                st.error(msg)
+
+        email_for_verification = signup_email.strip().lower()
+        verify_disabled = not email_for_verification or not otp_code
+
+        if st.button("Verify Email", use_container_width=True, disabled=verify_disabled, key="verify_otp_btn"):
+            ok, msg = verify_signup_otp(email_for_verification, otp_code)
+            if ok:
+                st.session_state.otp_verified_email = email_for_verification
+                st.success(msg)
+            else:
+                st.error(msg)
+
+        is_verified_for_signup = st.session_state.otp_verified_email == signup_email.strip().lower() and bool(signup_email.strip())
+        if is_verified_for_signup:
+            st.success("Email is verified and ready for signup.")
+        elif signup_email:
+            st.caption("Complete email verification before creating the account.")
+
+        if st.button("Create Account", use_container_width=True, key="signup_submit"):
+            ok, msg = register_user(
+                signup_email,
+                signup_password,
+                signup_confirm,
+                email_verified=is_verified_for_signup
+            )
+            if ok:
+                st.success(msg)
+                st.session_state.auth_mode = "Login"
+                st.session_state.otp_sent_email = ""
+                st.session_state.otp_verified_email = ""
+                st.session_state.otp_debug_code = ""
             else:
                 st.error(msg)
 
@@ -820,22 +1071,18 @@ with col_y:
 # Top controls
 left, right = st.columns([2, 1])
 
+workspace_id = generate_workspace_id(st.session_state.user)
+
 with left:
-    raw_client_id = st.text_input(
-        "Client ID",
-        placeholder="e.g. company1",
-        help="Data is stored separately for each client"
-    )
+    st.markdown("### Workspace")
+    st.success(f"Automatic workspace: `{workspace_id}`")
+    st.caption("Workspace is generated automatically from the logged-in email. No Client ID input is required.")
 
 with right:
     chunk_size = st.number_input("Chunk Size", min_value=200, max_value=1200, value=500, step=50)
     chunk_overlap = st.number_input("Chunk Overlap", min_value=0, max_value=300, value=80, step=10)
 
-client_id = safe_client_id(raw_client_id) if raw_client_id else ""
-
-if not client_id:
-    st.warning("Please enter a Client ID to continue.")
-    st.stop()
+client_id = workspace_id
 
 has_access, access_msg = authorize_client_access(st.session_state.user, client_id)
 if not has_access:
@@ -851,7 +1098,7 @@ with st.sidebar:
     st.write(f"**Product:** `DocuMind AI`")
     st.write(f"**User:** `{st.session_state.user}`")
     st.write(f"**Role:** `{st.session_state.role}`")
-    st.write(f"**Client ID:** `{client_id}`")
+    st.write(f"**Workspace ID:** `{client_id}`")
     st.write(f"**Storage Path:** `{cdir}`")
 
     index, chunk_records = load_client_artifacts(cdir)
@@ -900,7 +1147,7 @@ else:
 
 if clear_clicked:
     reset_client_data(cdir)
-    st.success(f"Stored data for client {client_id} was cleared.")
+    st.success(f"Stored data for workspace {client_id} was cleared.")
     st.session_state.messages = []
     log_event(st.session_state.user, "clear_client_data", client_id)
 
@@ -951,7 +1198,7 @@ if build_clicked:
                     log_event(st.session_state.user, "build_index", client_id)
 
                     st.success(
-                        f"Index was successfully built for client '{client_id}'. "
+                        f"Index was successfully built for workspace '{client_id}'. "
                         f"Number of chunks: {len(chunk_records)}"
                     )
                 except Exception as e:
