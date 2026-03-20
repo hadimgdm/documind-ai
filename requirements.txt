@@ -7,3 +7,4 @@ pytesseract
 pillow
 pandas
 openpyxl
+bcrypt
