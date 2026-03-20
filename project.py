@@ -2,6 +2,7 @@ import os
 import re
 import json
 import hashlib
+import time
 from pathlib import Path
 from io import BytesIO
 
@@ -13,6 +14,7 @@ from pypdf import PdfReader
 import pytesseract
 from PIL import Image
 import pandas as pd
+import bcrypt
 
 # Page configuration
 st.set_page_config(page_title="DocuMind AI", page_icon="🧠", layout="wide")
@@ -31,6 +33,10 @@ client = OpenAI(api_key=api_key)
 BASE_DIR = Path("data")
 BASE_DIR.mkdir(exist_ok=True)
 
+# Security storage files
+USERS_FILE = BASE_DIR / "users.json"
+LOG_FILE = BASE_DIR / "logs.json"
+
 # Models
 EMBED_MODEL = "text-embedding-3-small"
 CHAT_MODEL = "gpt-4.1-mini"
@@ -41,12 +47,24 @@ DEFAULT_CHUNK_OVERLAP = 80
 RETRIEVE_CANDIDATES = 12
 FINAL_TOP_K = 5
 
+# Security settings
+MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024
+MAX_REQUESTS_PER_DAY = 100
+ALLOWED_FILE_TYPES = {".txt", ".pdf", ".png", ".jpg", ".jpeg", ".xlsx", ".xls"}
+
 # Set Tesseract path manually if needed
 # pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 # Chat memory
 if "messages" not in st.session_state:
     st.session_state.messages = []
+
+# Auth session
+if "user" not in st.session_state:
+    st.session_state.user = None
+
+if "role" not in st.session_state:
+    st.session_state.role = None
 
 # Clean client ID
 def safe_client_id(raw: str) -> str:
@@ -87,6 +105,166 @@ def normalize_text(text: str) -> str:
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+# =========================
+# Security: auth / access
+# =========================
+
+# Load users
+def load_users() -> dict:
+    return load_json(USERS_FILE, {})
+
+# Save users
+def save_users(users: dict) -> None:
+    save_json(USERS_FILE, users)
+
+# Load logs
+def load_logs() -> dict:
+    data = load_json(LOG_FILE, {})
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("events", [])
+    data.setdefault("rate_limits", {})
+    return data
+
+# Save logs
+def save_logs(logs: dict) -> None:
+    save_json(LOG_FILE, logs)
+
+# Log security / usage events
+def log_event(user: str, action: str, details: str = "") -> None:
+    logs = load_logs()
+    logs["events"].append({
+        "user": user,
+        "action": action,
+        "details": details,
+        "time": time.time()
+    })
+    save_logs(logs)
+
+# Register user
+def register_user(email: str, password: str, confirm_password: str) -> tuple[bool, str]:
+    email = email.strip().lower()
+    users = load_users()
+
+    if not email:
+        return False, "Email is required."
+    if "@" not in email:
+        return False, "Please enter a valid email address."
+    if email in users:
+        return False, "This email is already registered."
+    if len(password) < 8:
+        return False, "Password must be at least 8 characters long."
+    if password != confirm_password:
+        return False, "Passwords do not match."
+
+    hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+    users[email] = {
+        "password": hashed,
+        "role": "owner",
+        "allowed_clients": [],
+        "created_at": time.time(),
+        "is_active": True
+    }
+
+    save_users(users)
+    log_event(email, "signup", "account_created")
+    return True, "Account created successfully. Please log in."
+
+# Login user
+def login_user(email: str, password: str) -> tuple[bool, str]:
+    email = email.strip().lower()
+    users = load_users()
+
+    if email not in users:
+        return False, "Account not found."
+
+    user = users[email]
+
+    if not user.get("is_active", True):
+        return False, "This account is disabled."
+
+    hashed = user["password"].encode("utf-8")
+
+    if bcrypt.checkpw(password.encode("utf-8"), hashed):
+        st.session_state.user = email
+        st.session_state.role = user.get("role", "user")
+        log_event(email, "login", "success")
+        return True, "Logged in successfully."
+
+    log_event(email, "login", "failed")
+    return False, "Invalid email or password."
+
+# Logout user
+def logout_user() -> None:
+    if st.session_state.user:
+        log_event(st.session_state.user, "logout", "manual")
+    st.session_state.user = None
+    st.session_state.role = None
+    st.session_state.messages = []
+
+# Workspace authorization
+def authorize_client_access(email: str, client_id: str) -> tuple[bool, str]:
+    users = load_users()
+    user = users.get(email)
+
+    if not user:
+        return False, "User not found."
+
+    role = user.get("role", "user")
+    allowed_clients = user.get("allowed_clients", [])
+
+    if role == "superadmin":
+        return True, "Access granted."
+
+    if client_id in allowed_clients:
+        return True, "Access granted."
+
+    if not allowed_clients:
+        user["allowed_clients"] = [client_id]
+        users[email] = user
+        save_users(users)
+        log_event(email, "client_bound", client_id)
+        return True, "First workspace assigned."
+
+    return False, "You are not allowed to access this workspace."
+
+# File validation
+def validate_uploaded_file(file) -> tuple[bool, str]:
+    name = file.name
+    suffix = Path(name).suffix.lower()
+    size = len(file.getvalue())
+
+    if suffix not in ALLOWED_FILE_TYPES:
+        return False, f"Unsupported file type: {suffix}"
+
+    if size > MAX_FILE_SIZE_BYTES:
+        return False, f"File too large: {name}. Max allowed size is 5 MB."
+
+    return True, "ok"
+
+# Rate limiting
+def check_rate_limit(user: str) -> bool:
+    logs = load_logs()
+    now = time.time()
+
+    user_entries = logs["rate_limits"].get(user, [])
+    user_entries = [t for t in user_entries if now - t < 86400]
+
+    if len(user_entries) >= MAX_REQUESTS_PER_DAY:
+        logs["rate_limits"][user] = user_entries
+        save_logs(logs)
+        return False
+
+    user_entries.append(now)
+    logs["rate_limits"][user] = user_entries
+    save_logs(logs)
+    return True
+
+# Management permission
+def can_manage_workspace(role: str) -> bool:
+    return role in {"owner", "admin", "superadmin"}
 
 # Read TXT file
 def extract_text_from_txt(file_bytes: bytes) -> str:
@@ -157,6 +335,13 @@ def extract_text(file) -> list[dict]:
     name = file.name
     suffix = Path(name).suffix.lower()
     raw = file.getvalue()
+
+    if len(raw) > MAX_FILE_SIZE_BYTES:
+        return [{
+            "text": "File too large.",
+            "source": name,
+            "location": "validation_error"
+        }]
 
     segments = []
 
@@ -558,7 +743,54 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-st.info("Step 1: Enter Client ID → Step 2: Upload files → Step 3: Build Index → Step 4: Ask questions or generate reports")
+st.info("Step 1: Sign up or log in → Step 2: Enter Client ID → Step 3: Upload files → Step 4: Build Index → Step 5: Ask questions or generate reports")
+
+# Authentication
+st.subheader("🔐 Authentication")
+
+auth_col1, auth_col2 = st.columns(2)
+
+with auth_col1:
+    auth_mode = st.radio("Mode", ["Login", "Signup"], horizontal=True)
+    auth_email = st.text_input("Email", key="auth_email")
+    auth_password = st.text_input("Password", type="password", key="auth_password")
+
+with auth_col2:
+    auth_confirm = ""
+    if auth_mode == "Signup":
+        auth_confirm = st.text_input("Confirm Password", type="password", key="auth_confirm")
+    st.write("")
+    st.write("")
+
+    if auth_mode == "Signup":
+        if st.button("Create Account", use_container_width=True):
+            ok, msg = register_user(auth_email, auth_password, auth_confirm)
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
+
+    if auth_mode == "Login":
+        if st.button("Login", use_container_width=True):
+            ok, msg = login_user(auth_email, auth_password)
+            if ok:
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
+
+if not st.session_state.user:
+    st.stop()
+
+login_info_col1, login_info_col2 = st.columns([3, 1])
+
+with login_info_col1:
+    st.success(f"Logged in as: {st.session_state.user} | Role: {st.session_state.role}")
+
+with login_info_col2:
+    if st.button("Logout", use_container_width=True):
+        logout_user()
+        st.rerun()
 
 col_x, col_y = st.columns(2)
 
@@ -605,6 +837,11 @@ if not client_id:
     st.warning("Please enter a Client ID to continue.")
     st.stop()
 
+has_access, access_msg = authorize_client_access(st.session_state.user, client_id)
+if not has_access:
+    st.error(access_msg)
+    st.stop()
+
 cdir = client_dir(client_id)
 cache_path = cdir / "embedding_cache.json"
 
@@ -612,6 +849,8 @@ cache_path = cdir / "embedding_cache.json"
 with st.sidebar:
     st.header("Project Status")
     st.write(f"**Product:** `DocuMind AI`")
+    st.write(f"**User:** `{st.session_state.user}`")
+    st.write(f"**Role:** `{st.session_state.role}`")
     st.write(f"**Client ID:** `{client_id}`")
     st.write(f"**Storage Path:** `{cdir}`")
 
@@ -652,12 +891,18 @@ uploaded_files = st.file_uploader(
 col_a, col_b = st.columns(2)
 
 build_clicked = col_a.button("Build / Rebuild Index", use_container_width=True)
-clear_clicked = col_b.button("Clear Client Data", use_container_width=True)
+
+clear_clicked = False
+if can_manage_workspace(st.session_state.role):
+    clear_clicked = col_b.button("Clear Client Data", use_container_width=True)
+else:
+    col_b.button("Clear Client Data (admin only)", use_container_width=True, disabled=True)
 
 if clear_clicked:
     reset_client_data(cdir)
     st.success(f"Stored data for client {client_id} was cleared.")
     st.session_state.messages = []
+    log_event(st.session_state.user, "clear_client_data", client_id)
 
 if build_clicked:
     if not uploaded_files:
@@ -668,6 +913,12 @@ if build_clicked:
         total_files = len(uploaded_files)
 
         for n, file in enumerate(uploaded_files, start=1):
+            valid, validation_message = validate_uploaded_file(file)
+            if not valid:
+                st.error(validation_message)
+                log_event(st.session_state.user, "file_validation_failed", f"{file.name} | {validation_message}")
+                continue
+
             segments = extract_text(file)
             all_segments.extend(segments)
             extraction_progress.progress(
@@ -697,6 +948,7 @@ if build_clicked:
                 try:
                     index = build_faiss_index(vectors)
                     save_client_artifacts(cdir, index, chunk_records)
+                    log_event(st.session_state.user, "build_index", client_id)
 
                     st.success(
                         f"Index was successfully built for client '{client_id}'. "
@@ -704,6 +956,7 @@ if build_clicked:
                     )
                 except Exception as e:
                     st.error(f"Failed to build index: {e}")
+                    log_event(st.session_state.user, "build_index_failed", str(e))
 
 # Load saved data
 index, chunk_records = load_client_artifacts(cdir)
@@ -718,6 +971,11 @@ for message in st.session_state.messages:
 prompt = st.chat_input("Ask a question about this client's documents")
 
 if prompt:
+    if not check_rate_limit(st.session_state.user):
+        st.error(f"Rate limit exceeded. Max {MAX_REQUESTS_PER_DAY} requests per day.")
+        log_event(st.session_state.user, "rate_limit_blocked", client_id)
+        st.stop()
+
     if index is None or not chunk_records:
         st.error("No index exists for this client yet. Upload files and build the index first.")
     else:
@@ -730,6 +988,7 @@ if prompt:
         })
 
         try:
+            log_event(st.session_state.user, "question", prompt[:200])
             selected_chunks = retrieve_chunks(index, chunk_records, prompt)
             answer = answer_with_context(prompt, selected_chunks)
 
@@ -757,6 +1016,7 @@ if prompt:
 
         except Exception as e:
             st.error(f"An error occurred during retrieval or answering: {e}")
+            log_event(st.session_state.user, "question_failed", str(e))
 
 # Reports and suggestions
 st.subheader("3) Management Insights")
@@ -770,11 +1030,13 @@ if col_r1.button("Generate Report", use_container_width=True):
     else:
         with st.spinner("Generating report..."):
             try:
+                log_event(st.session_state.user, "generate_report", client_id)
                 report = generate_report_from_chunks(chunk_records)
                 st.markdown("### Report")
                 st.write(report)
             except Exception as e:
                 st.error(f"Failed to generate report: {e}")
+                log_event(st.session_state.user, "generate_report_failed", str(e))
 
 if col_r2.button("Generate Suggestions", use_container_width=True):
     if not chunk_records:
@@ -782,11 +1044,13 @@ if col_r2.button("Generate Suggestions", use_container_width=True):
     else:
         with st.spinner("Generating suggestions..."):
             try:
+                log_event(st.session_state.user, "generate_suggestions", client_id)
                 suggestions = generate_suggestions_from_chunks(chunk_records)
                 st.markdown("### Suggestions")
                 st.write(suggestions)
             except Exception as e:
                 st.error(f"Failed to generate suggestions: {e}")
+                log_event(st.session_state.user, "generate_suggestions_failed", str(e))
 
 if col_r3.button("Generate Risk Highlights", use_container_width=True):
     if not chunk_records:
@@ -794,11 +1058,13 @@ if col_r3.button("Generate Risk Highlights", use_container_width=True):
     else:
         with st.spinner("Extracting risks..."):
             try:
+                log_event(st.session_state.user, "generate_risks", client_id)
                 risks = generate_risk_highlights(chunk_records)
                 st.markdown("### Risk Highlights")
                 st.write(risks)
             except Exception as e:
                 st.error(f"Failed to extract risks: {e}")
+                log_event(st.session_state.user, "generate_risks_failed", str(e))
 
 if col_r4.button("Generate FAQ", use_container_width=True):
     if not chunk_records:
@@ -806,8 +1072,10 @@ if col_r4.button("Generate FAQ", use_container_width=True):
     else:
         with st.spinner("Generating FAQ..."):
             try:
+                log_event(st.session_state.user, "generate_faq", client_id)
                 faq = generate_faq_from_chunks(chunk_records)
                 st.markdown("### FAQ")
                 st.write(faq)
             except Exception as e:
                 st.error(f"Failed to generate FAQ: {e}")
+                log_event(st.session_state.user, "generate_faq_failed", str(e))
