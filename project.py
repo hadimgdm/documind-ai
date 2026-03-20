@@ -918,7 +918,6 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-st.info("Step 1: Sign up or log in → Step 2: Your workspace is created automatically from your email → Step 3: Upload files → Step 4: Build Index → Step 5: Ask questions or generate reports")
 
 # Authentication
 st.subheader("🔐 Authentication")
@@ -982,7 +981,6 @@ else:
     with signup_right:
         st.markdown("### Verify email")
         predicted_workspace = generate_workspace_id(signup_email) if signup_email else "ws-generated-after-email"
-        st.caption("Client ID has been removed from the UI.")
         st.info(f"Your workspace will be created automatically: `{predicted_workspace}`")
 
         send_disabled = not signup_email
